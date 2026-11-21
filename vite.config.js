@@ -3,7 +3,7 @@ import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import { defineConfig } from 'vite'
 
-const pages = ['register', 'certificate']
+const pages = ['register', 'certificate', 'admin']
 
 // Vite only serves /register/ (trailing slash) as the page; /register would fall
 // back to the home page. Redirect the slash-less URL in dev and preview.

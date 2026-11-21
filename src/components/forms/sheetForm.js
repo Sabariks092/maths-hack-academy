@@ -20,7 +20,11 @@ export async function submitToSheet(action, data) {
   } catch {
     throw new Error('Unexpected response from the server. Please try again.')
   }
-  if (!json.ok) throw new Error(json.message || 'Something went wrong. Please try again.')
+  if (!json.ok) {
+    const err = new Error(json.message || 'Something went wrong. Please try again.')
+    err.code = json.code // e.g. 'auth' when the admin password is wrong
+    throw err
+  }
   return json
 }
 

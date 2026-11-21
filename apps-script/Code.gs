@@ -7,15 +7,16 @@
  *  WHAT IT DOES
  *  ------------
  *  1. action "register"    → saves the registration in the "Registrations" tab.
- *  2. action "certificate" → cross-checks the student against "Registrations"
- *                            (email + mobile + student name must all match).
- *                            Only if registered:
- *                              a. saves the request in the "Certificates" tab,
- *                              b. writes the student name + date onto the
- *                                 certificate template and saves it as a PNG
- *                                 in Google Drive,
- *                              c. emails the admin (notification), and
- *                              d. emails the student the certificate.
+ *  2. action "certificate" → the student REQUESTS a certificate. It is checked
+ *                            against "Registrations" (email + mobile + student
+ *                            name must all match), marked "Requested", logged in
+ *                            the "Certificates" tab, and the admin is emailed.
+ *                            Nothing is sent to the student yet.
+ *  3. Admin page (/admin/, password protected) → lists all students, lets the
+ *     admin create trainers, assign a trainer + mode of training, and
+ *     ISSUE or REJECT each certificate request. Only on "Issue" is the
+ *     certificate rendered (name + date on the template → PNG in Drive) and
+ *     emailed to the student's registered email address.
  *
  *  ONE-TIME SETUP
  *  --------------
@@ -28,9 +29,20 @@
  *     into CONFIG.TEMPLATE_FILE_ID below.
  *     (Alternatively leave it empty and set CONFIG.TEMPLATE_URL to the public
  *     URL of the image on your website.)
+ *  3b. CERTIFICATE SLIDE (one time): in Google Drive create a blank Google
+ *     Slides file, then File → Page setup → Custom → 960 × 678 points
+ *     (or 1280 × 904 pixels) → Apply. Copy its ID from the URL
+ *     (docs.google.com/presentation/d/<THIS_PART>/edit) into
+ *     CONFIG.SLIDES_TEMPLATE_ID. Leave the slide empty; the script copies it
+ *     for each certificate and fills it in.
+ *  3c. ADMIN PASSWORD: Project Settings (gear icon) → Script properties →
+ *     Add script property:  Property = ADMIN_PASS   Value = <your password>.
+ *     The admin page sends the typed password; it is checked HERE, so it is
+ *     never stored in the website's code.
  *  4. Set CONFIG.ADMIN_EMAIL (and optionally CONFIG.CERT_FOLDER_ID).
  *  5. Select the function "setup" in the toolbar and click Run. Approve the
- *     permissions. This creates both tabs with headers + the Drive folder.
+ *     permissions. This creates the tabs with headers + the Drive folder, and
+ *     adds the new columns to an existing Registrations tab.
  *  6. (Optional) Run "testCertificate" — it renders a sample certificate into
  *     the Drive folder and logs its link, so you can check the placement.
  *  7. Deploy → New deployment → type "Web app"
@@ -45,20 +57,31 @@
  */
 
 const CONFIG = {
-  ADMIN_EMAIL: 'admin@example.com', // ← who gets notified (comma-separate for several)
+  ADMIN_EMAIL: 'mathvmhacks@gmail.com', // ← who gets notified (comma-separate for several)
   ACADEMY_NAME: 'Math Hacks Academy',
   NOTIFY_ADMIN_ON_REGISTRATION: false, // set true to also get an email for each registration
+  ADMIN_PAGE_URL: 'https://maths-hack-academy.vercel.app/admin/', // linked in the "new request" email
 
   REGISTRATION_SHEET: 'Registrations',
   CERTIFICATE_SHEET: 'Certificates',
+  TRAINER_SHEET: 'Trainers',
 
-  TEMPLATE_FILE_ID: '', // ← Drive file ID of certificate_template.jpeg
-  TEMPLATE_URL: '', //      or a public URL to it, e.g. https://yourdomain.com/certificate_template.jpeg
-  CERT_FOLDER_ID: '', //    optional; if empty a "Math Hacks Certificates" folder is created
+  // Choices for the "Mode of Training" column on the admin page.
+  TRAINING_MODES: ['Online', 'Offline', 'Hybrid'],
+
+  TEMPLATE_FILE_ID: '1Cqw2o2WLNY41mR_JgO0-TLl9Lg-p6arc', // ← Drive file ID of certificate_template.jpeg
+  TEMPLATE_URL: 'https://maths-hack-academy.vercel.app/certificate_template.jpeg', //      or a public URL to it, e.g. https://yourdomain.com/certificate_template.jpeg
+  CERT_FOLDER_ID: '18rUd4iHIpwKwdXlF5GZkqqIeT1y7r-Vj', //    optional; if empty a "Math Hacks Certificates" folder is created
   CERT_FOLDER_NAME: 'Math Hacks Certificates',
+
+  // Google Slides file set to the certificate's page size (see "CERTIFICATE SLIDE"
+  // in the setup notes): docs.google.com/presentation/d/<THIS_PART>/edit
+  SLIDES_TEMPLATE_ID: '1NzMf1wUxrZzkkdVKaK0a9Hkioig7PjR3OiEG-q6jFl4',
 
   TIMEZONE: 'Asia/Kolkata',
   DATE_FORMAT: 'dd MMMM yyyy', // e.g. 02 November 2026
+
+  ADMIN_MAX_FAILED_LOGINS: 10, // wrong passwords allowed per 15 minutes before admin login pauses
 };
 
 /**
@@ -93,11 +116,27 @@ const LAYOUT = {
 const REG_HEADERS = [
   'Timestamp', 'Registration ID', 'Student Name', 'Parent Name',
   'Mobile', 'Email', 'Student DOB', 'Message',
+  'Trainer', 'Mode of Training',
+  'Certificate', 'Certificate URL', 'Certificate Issue Date', 'Certificate File ID',
 ];
+/** Column positions (0-based) in the Registrations tab. */
+const RC = {
+  TS: 0, ID: 1, NAME: 2, PARENT: 3, MOBILE: 4, EMAIL: 5, DOB: 6, MSG: 7,
+  TRAINER: 8, MODE: 9, CERT: 10, CERT_URL: 11, CERT_DATE: 12, CERT_FILE: 13,
+};
+const CERT_STATUS = {
+  NONE: 'Not requested',
+  REQUESTED: 'Requested',
+  ISSUED: 'Issued',
+  REJECTED: 'Rejected',
+};
+
+/** Request log (one row per request; the Registrations tab holds the current state). */
 const CERT_HEADERS = [
   'Timestamp', 'Request ID', 'Student Name', 'Email', 'Mobile',
   'Registration ID', 'Certificate Date', 'Certificate Link', 'Certificate File ID', 'Status',
 ];
+const TRAINER_HEADERS = ['Trainer Name', 'Added On'];
 
 /* ========================================================================== */
 /*  Web app entry points                                                      */
@@ -120,7 +159,8 @@ function doPost(e) {
 
   try {
     if (data.action === 'register') return json_(handleRegistration_(data));
-    if (data.action === 'certificate') return json_(handleCertificate_(data));
+    if (data.action === 'certificate') return json_(handleCertificateRequest_(data));
+    if (String(data.action || '').indexOf('admin') === 0) return json_(handleAdmin_(data));
     return json_({ ok: false, message: 'Unknown action.' });
   } catch (err) {
     console.error(err && err.stack ? err.stack : err);
@@ -153,17 +193,18 @@ function handleRegistration_(d) {
 
     // Same student already registered with the same contact details → don't duplicate.
     const existing = rows.find(r =>
-      normalizeEmail_(r[5]) === email &&
-      normalizePhone_(r[4]) === mobile &&
-      nameKey_(r[2]) === nameKey_(studentName));
+      normalizeEmail_(r[RC.EMAIL]) === email &&
+      normalizePhone_(r[RC.MOBILE]) === mobile &&
+      nameKey_(r[RC.NAME]) === nameKey_(studentName));
     if (existing) {
-      return { ok: true, message: `${studentName} is already registered (ID ${existing[1]}). We'll be in touch soon!` };
+      return { ok: true, message: `${studentName} is already registered (ID ${existing[RC.ID]}). We'll be in touch soon!` };
     }
 
     const regId = 'MHR-' + String(rows.length + 1).padStart(4, '0');
     sheet.appendRow([
       new Date(), regId, safe_(studentName), safe_(parentName),
       "'" + mobile, safe_(email), "'" + dob, safe_(message),
+      '', '', CERT_STATUS.NONE, '', '', '',
     ]);
 
     if (CONFIG.NOTIFY_ADMIN_ON_REGISTRATION) {
@@ -187,10 +228,10 @@ function handleRegistration_(d) {
 }
 
 /* ========================================================================== */
-/*  Course completion certificate                                             */
+/*  Certificate request (public form) — needs admin approval                  */
 /* ========================================================================== */
 
-function handleCertificate_(d) {
+function handleCertificateRequest_(d) {
   const studentName = cleanName_(d.studentName);
   const email = normalizeEmail_(d.email);
   const mobile = normalizePhone_(d.mobile);
@@ -203,83 +244,277 @@ function handleCertificate_(d) {
   lock.waitLock(30000);
   try {
     // ---- 1. Cross-validate against the Registrations tab -------------------
-    const regRows = getSheet_(CONFIG.REGISTRATION_SHEET, REG_HEADERS).getDataRange().getValues().slice(1);
+    const regSheet = getSheet_(CONFIG.REGISTRATION_SHEET, REG_HEADERS);
+    const regRows = regSheet.getDataRange().getValues().slice(1);
     const contactMatches = regRows.filter(r =>
-      normalizeEmail_(r[5]) === email && normalizePhone_(r[4]) === mobile);
+      normalizeEmail_(r[RC.EMAIL]) === email && normalizePhone_(r[RC.MOBILE]) === mobile);
 
     if (!contactMatches.length) {
       return fail_('We couldn\'t find a registration with this email and mobile number. ' +
         'Please use the same details you registered with, or contact the academy.');
     }
-    const reg = contactMatches.find(r => nameKey_(r[2]) === nameKey_(studentName));
+    const reg = contactMatches.find(r => nameKey_(r[RC.NAME]) === nameKey_(studentName));
     if (!reg) {
       return fail_('The student name doesn\'t match our registration records for this email and mobile. ' +
         'Please enter the name exactly as registered.');
     }
-    const regId = String(reg[1]);
+    const regId = String(reg[RC.ID]);
+    const regName = String(reg[RC.NAME]);
+    const regEmail = normalizeEmail_(reg[RC.EMAIL]);
+    const rowNumber = regRows.indexOf(reg) + 2;
+    const status = certStatus_(reg);
 
-    // ---- 2. Already issued? Re-send instead of creating a duplicate --------
+    // ---- 2. Already issued → re-send (at most once an hour) ---------------
+    if (status === CERT_STATUS.ISSUED && reg[RC.CERT_FILE]) {
+      const cache = CacheService.getScriptCache();
+      const key = 'resent_' + regId;
+      if (!cache.get(key)) {
+        const file = DriveApp.getFileById(String(reg[RC.CERT_FILE]));
+        sendStudentEmail_(regEmail, regName, file.getBlob());
+        cache.put(key, '1', 3600);
+      }
+      return {
+        ok: true,
+        message: `The certificate for ${regName} has already been issued. We've sent it to ${regEmail} — please check your inbox and spam folder.`,
+      };
+    }
+
+    // ---- 3. Already waiting for approval ----------------------------------
+    if (status === CERT_STATUS.REQUESTED) {
+      return {
+        ok: true,
+        message: `We already have a certificate request for ${regName}. It will be emailed to ${regEmail} as soon as the academy approves it.`,
+      };
+    }
+
+    // ---- 4. New request (or a new request after a rejection) ---------------
+    regSheet.getRange(rowNumber, RC.CERT + 1).setValue(CERT_STATUS.REQUESTED);
+
     const certSheet = getSheet_(CONFIG.CERTIFICATE_SHEET, CERT_HEADERS);
-    const certRows = certSheet.getDataRange().getValues().slice(1);
-    const issued = certRows.find(r => String(r[5]) === regId && r[8] && String(r[9]).indexOf('Sent') === 0);
-    if (issued) {
-      const file = DriveApp.getFileById(String(issued[8]));
-      sendStudentEmail_(email, String(issued[2]), file.getBlob());
-      return { ok: true, message: `A certificate was already issued for ${issued[2]}. We've re-sent it to ${email}.` };
-    }
-
-    // ---- 3. Save the request in the Certificates tab -----------------------
-    const now = new Date();
-    const certDate = Utilities.formatDate(now, CONFIG.TIMEZONE, CONFIG.DATE_FORMAT);
-    const requestId = 'MHC-' + String(certRows.length + 1).padStart(4, '0');
+    const requestId = 'MHC-' + String(Math.max(certSheet.getLastRow(), 1)).padStart(4, '0');
     certSheet.appendRow([
-      now, requestId, safe_(studentName), safe_(email), "'" + mobile,
-      regId, certDate, '', '', 'Generating…',
+      new Date(), requestId, safe_(regName), safe_(regEmail), "'" + mobile,
+      regId, '', '', '', 'Pending approval',
     ]);
-    const rowIndex = certSheet.getLastRow();
-    const setStatus = (link, fileId, status) =>
-      certSheet.getRange(rowIndex, 8, 1, 3).setValues([[link, fileId, status]]);
 
-    // ---- 4. Generate certificate → Drive ----------------------------------
-    let file;
-    try {
-      file = createCertificate_(studentName, certDate);
-    } catch (err) {
-      console.error(err && err.stack ? err.stack : err);
-      setStatus('', '', 'Failed: ' + (err.message || err));
-      MailApp.sendEmail(CONFIG.ADMIN_EMAIL, `Certificate generation FAILED: ${studentName}`,
-        `Request ${requestId} for ${studentName} (${email}, ${mobile}) could not be generated.\n\nError: ${err.message || err}`);
-      return fail_('Your details are verified, but we couldn\'t generate the certificate right now. ' +
-        'Our team has been notified and will email it to you shortly.');
-    }
-
-    // ---- 5. Emails: admin + student ---------------------------------------
-    const errors = [];
-    try {
-      sendStudentEmail_(email, studentName, file.getBlob());
-    } catch (err) { errors.push('student email: ' + err.message); }
     try {
       MailApp.sendEmail({
         to: CONFIG.ADMIN_EMAIL,
-        subject: `Certificate issued: ${studentName} (${requestId})`,
-        htmlBody: adminTable_('Course completion certificate issued', [
-          ['Request ID', requestId], ['Registration ID', regId], ['Student', studentName],
-          ['Email', email], ['Mobile', mobile], ['Certificate date', certDate],
-          ['Certificate', `<a href="${file.getUrl()}">Open in Google Drive</a>`],
+        subject: `Certificate request awaiting approval: ${regName} (${regId})`,
+        htmlBody: adminTable_('New course certificate request — please approve or reject', [
+          ['Request ID', requestId], ['Registration ID', regId], ['Student', regName],
+          ['Email', regEmail], ['Mobile', mobile], ['Trainer', String(reg[RC.TRAINER] || '—')],
+          ['Admin page', `<a href="${esc_(CONFIG.ADMIN_PAGE_URL)}">Open the admin page to issue or reject</a>`],
         ], true),
       });
-    } catch (err) { errors.push('admin email: ' + err.message); }
-
-    setStatus(file.getUrl(), file.getId(), errors.length ? 'Created — ' + errors.join('; ') : 'Sent');
-
-    if (errors.some(e => e.indexOf('student') === 0)) {
-      return fail_('Your certificate was created, but we couldn\'t email it. Our team will send it to you shortly.');
+    } catch (err) {
+      console.error('Admin notification failed: ' + err.message);
     }
-    return { ok: true, message: `Congratulations, ${studentName}! Your certificate has been emailed to ${email}.` };
+
+    return {
+      ok: true,
+      message: `Thank you! Your certificate request for ${regName} has been received. ` +
+        `Once the academy approves it, the certificate will be emailed to ${regEmail}.`,
+    };
   } finally {
     lock.releaseLock();
   }
 }
+
+/* ========================================================================== */
+/*  Admin API (password checked here, against Script property ADMIN_PASS)     */
+/* ========================================================================== */
+
+function handleAdmin_(d) {
+  const auth = checkAdmin_(d.password);
+  if (auth) return auth;
+
+  switch (d.action) {
+    case 'adminList': return adminList_();
+    case 'adminSaveStudent': return adminSaveStudent_(d);
+    case 'adminAddTrainer': return adminAddTrainer_(d);
+    case 'adminIssue': return adminIssue_(d);
+    case 'adminReject': return adminReject_(d);
+    default: return fail_('Unknown admin action.');
+  }
+}
+
+/** Returns null when the password is right, otherwise an error response. */
+function checkAdmin_(password) {
+  const expected = PropertiesService.getScriptProperties().getProperty('ADMIN_PASS');
+  if (!expected) {
+    return { ok: false, code: 'auth', message: 'The admin password is not set up yet (Script property ADMIN_PASS).' };
+  }
+  const cache = CacheService.getScriptCache();
+  const failures = Number(cache.get('admin_failed') || 0);
+  if (failures >= CONFIG.ADMIN_MAX_FAILED_LOGINS) {
+    return { ok: false, code: 'auth', message: 'Too many wrong passwords. Please wait 15 minutes and try again.' };
+  }
+  if (String(password || '') !== expected) {
+    cache.put('admin_failed', String(failures + 1), 900);
+    return { ok: false, code: 'auth', message: 'Wrong password.' };
+  }
+  return null;
+}
+
+function adminList_() {
+  const rows = getSheet_(CONFIG.REGISTRATION_SHEET, REG_HEADERS).getDataRange().getValues().slice(1);
+  return {
+    ok: true,
+    students: rows.filter(r => r[RC.ID]).map(studentJson_),
+    trainers: listTrainers_(),
+    modes: CONFIG.TRAINING_MODES,
+  };
+}
+
+function adminSaveStudent_(d) {
+  const trainer = cleanName_(d.trainer);
+  const mode = String(d.mode || '').trim();
+  if (trainer && listTrainers_().map(nameKey_).indexOf(nameKey_(trainer)) === -1) {
+    return fail_('Please add this trainer first.');
+  }
+  if (mode && CONFIG.TRAINING_MODES.indexOf(mode) === -1) return fail_('Unknown mode of training.');
+
+  return withStudent_(d.regId, (sheet, rowNumber) => {
+    sheet.getRange(rowNumber, RC.TRAINER + 1, 1, 2).setValues([[safe_(trainer), mode]]);
+    return { ok: true, message: 'Saved.' };
+  });
+}
+
+function adminAddTrainer_(d) {
+  const name = cleanName_(d.name);
+  if (!name) return fail_('Please enter the trainer\'s name.');
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const trainers = listTrainers_();
+    if (trainers.map(nameKey_).indexOf(nameKey_(name)) !== -1) return fail_(`${name} is already in the trainer list.`);
+    getSheet_(CONFIG.TRAINER_SHEET, TRAINER_HEADERS).appendRow([safe_(name), new Date()]);
+    return { ok: true, message: `Trainer ${name} added.`, trainers: trainers.concat(name) };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** Approve: render the certificate, email it to the registered address, record it. */
+function adminIssue_(d) {
+  return withStudent_(d.regId, (sheet, rowNumber, reg) => {
+    const status = certStatus_(reg);
+    if (status === CERT_STATUS.ISSUED) return fail_('This certificate has already been issued.');
+    if (status !== CERT_STATUS.REQUESTED) return fail_('The student hasn\'t requested a certificate.');
+
+    const name = String(reg[RC.NAME]);
+    const email = normalizeEmail_(reg[RC.EMAIL]);
+    const certDate = Utilities.formatDate(new Date(), CONFIG.TIMEZONE, CONFIG.DATE_FORMAT);
+
+    let file;
+    try {
+      file = createCertificate_(name, certDate);
+    } catch (err) {
+      console.error(err && err.stack ? err.stack : err);
+      return fail_('Could not generate the certificate: ' + (err.message || err));
+    }
+
+    sheet.getRange(rowNumber, RC.CERT + 1, 1, 4)
+      .setValues([[CERT_STATUS.ISSUED, file.getUrl(), "'" + certDate, file.getId()]]);
+
+    let emailError = '';
+    try {
+      sendStudentEmail_(email, name, file.getBlob());
+    } catch (err) {
+      emailError = err.message || String(err);
+    }
+    updateRequestLog_(String(reg[RC.ID]), [certDate, file.getUrl(), file.getId(),
+      emailError ? 'Issued — email failed: ' + emailError : 'Issued']);
+
+    return {
+      ok: true,
+      message: emailError
+        ? `Certificate created for ${name}, but the email failed (${emailError}). The student can submit the certificate form again to have it re-sent.`
+        : `Certificate issued and emailed to ${email}.`,
+    };
+  });
+}
+
+function adminReject_(d) {
+  return withStudent_(d.regId, (sheet, rowNumber, reg) => {
+    if (certStatus_(reg) !== CERT_STATUS.REQUESTED) return fail_('There is no pending request to reject.');
+    sheet.getRange(rowNumber, RC.CERT + 1).setValue(CERT_STATUS.REJECTED);
+    updateRequestLog_(String(reg[RC.ID]), ['', '', '', 'Rejected']);
+    return { ok: true, message: `Request from ${reg[RC.NAME]} rejected.` };
+  });
+}
+
+/**
+ * Finds a student by registration ID (under the script lock), runs fn, and
+ * attaches the student's fresh data to a successful result.
+ */
+function withStudent_(regId, fn) {
+  regId = String(regId || '').trim();
+  if (!regId) return fail_('Missing registration ID.');
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const sheet = getSheet_(CONFIG.REGISTRATION_SHEET, REG_HEADERS);
+    const rows = sheet.getDataRange().getValues();
+    const index = rows.findIndex((r, i) => i > 0 && String(r[RC.ID]) === regId);
+    if (index === -1) return fail_('Student not found. Please refresh the page.');
+    const rowNumber = index + 1;
+
+    const result = fn(sheet, rowNumber, rows[index]);
+    if (result.ok) {
+      SpreadsheetApp.flush();
+      result.student = studentJson_(sheet.getRange(rowNumber, 1, 1, REG_HEADERS.length).getValues()[0]);
+    }
+    return result;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** Updates the latest "Pending approval" log row for a registration (Certificate Date … Status). */
+function updateRequestLog_(regId, values) {
+  const sheet = getSheet_(CONFIG.CERTIFICATE_SHEET, CERT_HEADERS);
+  const rows = sheet.getDataRange().getValues();
+  for (let i = rows.length - 1; i > 0; i--) {
+    if (String(rows[i][5]) === regId && String(rows[i][9]) === 'Pending approval') {
+      values[0] = values[0] ? "'" + values[0] : '';
+      sheet.getRange(i + 1, 7, 1, 4).setValues([values]);
+      return;
+    }
+  }
+}
+
+function studentJson_(r) {
+  return {
+    regId: String(r[RC.ID]),
+    registeredAt: fmtDate_(r[RC.TS], 'dd MMM yyyy, hh:mm a'),
+    studentName: String(r[RC.NAME]),
+    parentName: String(r[RC.PARENT]),
+    mobile: String(r[RC.MOBILE]),
+    email: String(r[RC.EMAIL]),
+    dob: fmtDate_(r[RC.DOB], 'yyyy-MM-dd'),
+    message: String(r[RC.MSG]),
+    trainer: String(r[RC.TRAINER] || ''),
+    mode: String(r[RC.MODE] || ''),
+    certStatus: certStatus_(r),
+    certUrl: String(r[RC.CERT_URL] || ''),
+    certDate: fmtDate_(r[RC.CERT_DATE], CONFIG.DATE_FORMAT),
+  };
+}
+
+function certStatus_(r) {
+  return String(r[RC.CERT] || '').trim() || CERT_STATUS.NONE;
+}
+
+function listTrainers_() {
+  return getSheet_(CONFIG.TRAINER_SHEET, TRAINER_HEADERS).getDataRange().getValues().slice(1)
+    .map(r => String(r[0]).trim()).filter(Boolean);
+}
+
+/* ========================================================================== */
+/*  Certificate rendering                                                     */
+/* ========================================================================== */
 
 /**
  * Renders the certificate: template image as a slide background, name + date
@@ -288,47 +523,53 @@ function handleCertificate_(d) {
  */
 function createCertificate_(studentName, certDate) {
   const L = LAYOUT;
-  const k = L.PAGE_W_PT / L.TEMPLATE_W; // px → pt
-  const pageH = L.TEMPLATE_H * k;
+  if (!CONFIG.SLIDES_TEMPLATE_ID) {
+    throw new Error('Set CONFIG.SLIDES_TEMPLATE_ID (see "CERTIFICATE SLIDE" in the setup notes).');
+  }
 
-  const pres = Slides.Presentations.create({
-    title: 'tmp-certificate-' + Date.now(),
-    pageSize: {
-      width: { magnitude: L.PAGE_W_PT, unit: 'PT' },
-      height: { magnitude: pageH, unit: 'PT' },
-    },
-  });
-  const presId = pres.presentationId;
+  // The Slides API can't set a page size on new decks (they're always 16:9),
+  // so copy a deck that was set up once with the template's 1280×904 ratio.
+  const copy = DriveApp.getFileById(CONFIG.SLIDES_TEMPLATE_ID).makeCopy('tmp-certificate-' + Date.now());
+  const presId = copy.getId();
 
   try {
     const deck = SlidesApp.openById(presId);
-    const slide = deck.getSlides()[0];
+    const pageW = deck.getPageWidth();
+    const pageH = deck.getPageHeight();
+    checkPageRatio_(pageW, pageH);
+
+    // Template pixels → slide points, measured from the real page size.
+    const kx = pageW / L.TEMPLATE_W;
+    const ky = pageH / L.TEMPLATE_H;
+    const fs = pageW / L.PAGE_W_PT; // font sizes in LAYOUT assume a 960 pt wide page
+    const box = (b) => [b.left * kx, b.top * ky, b.width * kx, b.height * ky];
+
+    const slides = deck.getSlides();
+    slides.slice(1).forEach(s => s.remove());
+    const slide = slides[0];
     slide.getPageElements().forEach(el => el.remove());
     slide.getBackground().setPictureFill(getTemplateBlob_());
 
     // Student name
-    const nb = L.NAME_BOX;
-    const nameShape = slide.insertTextBox(studentName, nb.left * k, nb.top * k, nb.width * k, nb.height * k);
-    styleText_(nameShape, L.NAME_FONT, nameFontSize_(studentName), L.NAME_COLOR, false);
+    const nameShape = slide.insertTextBox(studentName, ...box(L.NAME_BOX));
+    styleText_(nameShape, L.NAME_FONT, nameFontSize_(studentName) * fs, L.NAME_COLOR, false);
 
     const u = L.NAME_UNDERLINE;
-    const line1 = slide.insertLine(SlidesApp.LineCategory.STRAIGHT, u.x1 * k, u.y * k, u.x2 * k, u.y * k);
+    const line1 = slide.insertLine(SlidesApp.LineCategory.STRAIGHT, u.x1 * kx, u.y * ky, u.x2 * kx, u.y * ky);
     line1.getLineFill().setSolidFill(u.color);
-    line1.setWeight(u.weightPt);
+    line1.setWeight(u.weightPt * fs);
 
     // Date (bottom-left)
-    const dv = L.DATE_VALUE_BOX;
-    const dateShape = slide.insertTextBox(certDate, dv.left * k, dv.top * k, dv.width * k, dv.height * k);
-    styleText_(dateShape, L.DATE_FONT, L.DATE_VALUE_PT, L.DATE_COLOR, false, true);
+    const dateShape = slide.insertTextBox(certDate, ...box(L.DATE_VALUE_BOX));
+    styleText_(dateShape, L.DATE_FONT, L.DATE_VALUE_PT * fs, L.DATE_COLOR, false, true);
 
     const dl = L.DATE_LINE;
-    const line2 = slide.insertLine(SlidesApp.LineCategory.STRAIGHT, dl.x1 * k, dl.y * k, dl.x2 * k, dl.y * k);
+    const line2 = slide.insertLine(SlidesApp.LineCategory.STRAIGHT, dl.x1 * kx, dl.y * ky, dl.x2 * kx, dl.y * ky);
     line2.getLineFill().setSolidFill(dl.color);
-    line2.setWeight(dl.weightPt);
+    line2.setWeight(dl.weightPt * fs);
 
-    const lb = L.DATE_LABEL_BOX;
-    const labelShape = slide.insertTextBox(L.DATE_LABEL, lb.left * k, lb.top * k, lb.width * k, lb.height * k);
-    styleText_(labelShape, L.DATE_FONT, L.DATE_LABEL_PT, L.DATE_COLOR, true);
+    const labelShape = slide.insertTextBox(L.DATE_LABEL, ...box(L.DATE_LABEL_BOX));
+    styleText_(labelShape, L.DATE_FONT, L.DATE_LABEL_PT * fs, L.DATE_COLOR, true);
 
     const pageId = slide.getObjectId();
     deck.saveAndClose();
@@ -344,6 +585,18 @@ function createCertificate_(studentName, certDate) {
     return getCertFolder_().createFile(png);
   } finally {
     try { DriveApp.getFileById(presId).setTrashed(true); } catch (e) { /* ignore */ }
+  }
+}
+
+/** The slide must have the template's shape, or the image gets stretched. */
+function checkPageRatio_(pageW, pageH) {
+  const want = LAYOUT.TEMPLATE_W / LAYOUT.TEMPLATE_H; // 1.416
+  const got = pageW / pageH;
+  if (Math.abs(got - want) / want > 0.01) {
+    throw new Error(
+      `Certificate slide is ${Math.round(pageW)} × ${Math.round(pageH)} pt (ratio ${got.toFixed(3)}), ` +
+      `but the template needs ratio ${want.toFixed(3)}. In the Slides file set ` +
+      'File → Page setup → Custom → 960 × 678 points (or 1280 × 904 pixels).');
   }
 }
 
@@ -430,12 +683,19 @@ function adminTable_(title, rows, allowHtmlInLast) {
 /*  Setup + test helpers (run these from the editor)                          */
 /* ========================================================================== */
 
-/** Run once: creates both tabs with headers and the certificate folder. */
+/** Run once (safe to re-run): creates/updates the tabs and checks the config. */
 function setup() {
   getSheet_(CONFIG.REGISTRATION_SHEET, REG_HEADERS);
   getSheet_(CONFIG.CERTIFICATE_SHEET, CERT_HEADERS);
+  getSheet_(CONFIG.TRAINER_SHEET, TRAINER_HEADERS);
   const folder = getCertFolder_();
   getTemplateBlob_(); // fails early if the template isn't configured
+  if (!CONFIG.SLIDES_TEMPLATE_ID) throw new Error('Set CONFIG.SLIDES_TEMPLATE_ID (setup step 3b).');
+  const deck = SlidesApp.openById(CONFIG.SLIDES_TEMPLATE_ID);
+  checkPageRatio_(deck.getPageWidth(), deck.getPageHeight());
+  if (!PropertiesService.getScriptProperties().getProperty('ADMIN_PASS')) {
+    console.warn('ADMIN_PASS is not set yet — the admin page will not open (setup step 3c).');
+  }
   console.log('Setup complete. Certificates folder: ' + folder.getUrl());
 }
 
@@ -450,13 +710,14 @@ function testCertificate() {
 /*  Utilities                                                                 */
 /* ========================================================================== */
 
+/** Gets (or creates) a tab and makes sure its header row has every column. */
 function getSheet_(name, headers) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   let sheet = ss.getSheetByName(name);
   if (!sheet) sheet = ss.insertSheet(name);
-  if (sheet.getLastRow() === 0) {
-    sheet.appendRow(headers);
-    sheet.getRange(1, 1, 1, headers.length)
+  const isEmpty = sheet.getLastRow() === 0;
+  if (isEmpty || sheet.getLastColumn() < headers.length) {
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers])
       .setFontWeight('bold').setBackground('#16150f').setFontColor('#f7f1e3');
     sheet.setFrozenRows(1);
   }
@@ -469,6 +730,11 @@ function json_(obj) {
 
 function fail_(message) {
   return { ok: false, message: message };
+}
+
+function fmtDate_(v, pattern) {
+  if (v instanceof Date && !isNaN(v)) return Utilities.formatDate(v, CONFIG.TIMEZONE, pattern);
+  return String(v == null ? '' : v);
 }
 
 /** Trim, collapse spaces, cap length. */

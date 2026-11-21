@@ -13,11 +13,11 @@ function CertificatePage() {
     <FormPage
       eyebrow="Course completion"
       title="Get your course certificate"
-      intro="Use the same student name, email and mobile number you registered with. Your certificate will be emailed to you."
+      intro="Use the same student name, email and mobile number you registered with. Once the academy approves your request, the certificate will be emailed to your registered email address."
     >
       {status.state === 'success' ? (
         <SuccessPanel
-          title="Certificate on its way!"
+          title="Request received!"
           message={status.message}
           actionLabel="Back to the form"
           onAction={reset}
@@ -59,7 +59,7 @@ function CertificatePage() {
             placeholder="98765 43210"
           />
           <ErrorNote message={status.state === 'error' ? status.message : ''} />
-          <SubmitButton sending={status.state === 'sending'}>Get my certificate</SubmitButton>
+          <SubmitButton sending={status.state === 'sending'}>Request my certificate</SubmitButton>
         </form>
       )}
     </FormPage>
